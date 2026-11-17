@@ -3,10 +3,19 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 
+from story_patterns.catalog.intake import (
+    ACCEPTED_ROW,
+    ALREADY_PRESENT_ROW,
+    batch_state,
+    source_digest,
+)
 from story_patterns.catalog.validate import digest_json, normalize_story
 from story_patterns.errors import ValidationError
 from story_patterns.review.adjudication import normalize_adjudication
 from story_patterns.review.validate import normalize_decision
+
+STORED_STATUSES = frozenset({ACCEPTED_ROW, ALREADY_PRESENT_ROW})
+KNOWN_STATUSES = frozenset({ACCEPTED_ROW, ALREADY_PRESENT_ROW, "invalid", "duplicate_in_batch", "conflict"})
 
 
 def audit_catalog(snapshot: dict) -> dict:
@@ -25,6 +34,9 @@ def audit_catalog(snapshot: dict) -> dict:
             issues.append(_issue("story", identity, "document and indexed columns disagree"))
         stories[identity] = normalized
     batch_rows = {row["batch_id"]: row for row in snapshot["batches"]}
+    ledger_by_batch = defaultdict(list)
+    for row in snapshot.get("batch_rows", []):
+        ledger_by_batch[row["batch_id"]].append(row)
     grouped = defaultdict(list)
     for relation in snapshot["batch_stories"]:
         identity = (relation["story_id"], relation["revision"])
@@ -35,6 +47,16 @@ def audit_catalog(snapshot: dict) -> dict:
         identities = sorted(grouped.get(batch_id, []))
         if row["story_count"] != len(identities):
             issues.append(_issue("batch", batch_id, "declared story count differs from linked records"))
+        ledger = ledger_by_batch.get(batch_id, [])
+        if row.get("state") in (None, "legacy") and not ledger:
+            # Pre-ledger batch: only accepted content can be verified.
+            if identities and all(identity in stories for identity in identities):
+                payload = {"batch_id": batch_id,
+                           "stories": [stories[identity] for identity in identities]}
+                if digest_json(payload) != row["digest"]:
+                    issues.append(_issue("batch", batch_id, "content digest differs from linked story revisions"))
+            continue
+        issues.extend(_check_ledger(batch_id, row, ledger, identities, batch_rows, stories))
         if not identities or any(identity not in stories for identity in identities):
             continue
         payload = {"batch_id": batch_id, "stories": [stories[identity] for identity in identities]}
@@ -100,6 +122,7 @@ def audit_catalog(snapshot: dict) -> dict:
     return {"ok": not issues, "story_revisions_checked": len(snapshot["stories"]),
             "batches_checked": len(snapshot["batches"]), "decisions_checked": len(snapshot["decisions"]),
             "batch_links_checked": len(snapshot["batch_stories"]),
+            "batch_rows_checked": len(snapshot.get("batch_rows", [])),
             "adjudications_checked": len(snapshot["adjudications"]), "reports_checked": len(snapshot["reports"]),
             "issue_count": len(issues), "issues": issues}
 
@@ -110,6 +133,63 @@ def grouped_by_identity(grouped: dict) -> dict:
         for identity in identities:
             result[identity].append(batch_id)
     return result
+
+
+def _check_ledger(batch_id: str, batch: dict, ledger: list[dict], identities: list[tuple[str, int]],
+                  batch_rows: dict, stories: dict) -> list[dict]:
+    """Cross-check a batch's row ledger against its link table and digests."""
+    issues = []
+    row_numbers = [row["row_number"] for row in ledger]
+    if row_numbers != list(range(1, len(ledger) + 1)):
+        issues.append(_issue("batch", batch_id, "row ledger numbers are not contiguous from one"))
+    if batch.get("source_row_count") not in (None, len(ledger)):
+        issues.append(_issue("batch", batch_id, "source row count differs from ledger length"))
+    linked = set(identities)
+    entries = []
+    for row in ledger:
+        entries.append({"row": row["row_number"], "row_digest": row["row_digest"]})
+        status = row["status"]
+        if status not in KNOWN_STATUSES:
+            issues.append(_issue("batch", batch_id, f"row {row['row_number']} has unknown status {status!r}"))
+            continue
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            issues.append(_issue("batch", batch_id, f"row {row['row_number']} payload is not valid JSON"))
+            continue
+        if digest_json(payload) != row["row_digest"]:
+            issues.append(_issue("batch", batch_id, f"row {row['row_number']} payload digest differs"))
+        identity = (row["story_id"], row["revision"])
+        if status in STORED_STATUSES:
+            if identity not in linked:
+                issues.append(_issue(
+                    "batch", batch_id,
+                    f"row {row['row_number']} is {status} but is not linked to a story revision"))
+            if row["story_digest"] is None or story_digest_of(payload) != row["story_digest"]:
+                issues.append(_issue("batch", batch_id, f"row {row['row_number']} story digest differs"))
+        else:
+            if identity in linked:
+                issues.append(_issue(
+                    "batch", batch_id,
+                    f"row {row['row_number']} is {status} but its story revision was linked"))
+    if batch.get("source_digest") is not None and source_digest(batch_id, entries) != batch["source_digest"]:
+        issues.append(_issue("batch", batch_id, "source digest differs from row ledger"))
+    if batch.get("state") in {"accepted", "partial", "rejected"}:
+        derived = batch_state([{"status": row["status"]} for row in ledger])
+        if derived != batch["state"]:
+            issues.append(_issue("batch", batch_id, "recorded state differs from row statuses"))
+        elif derived == "rejected" and identities:
+            issues.append(_issue("batch", batch_id, "rejected batch still links stored revisions"))
+    if batch.get("retry_of") is not None and batch["retry_of"] not in batch_rows:
+        issues.append(_issue("batch", batch_id, f"retry_of batch {batch['retry_of']} was not recorded"))
+    return issues
+
+
+def story_digest_of(document) -> str | None:
+    try:
+        return digest_json(normalize_story(document))
+    except (ValidationError, TypeError):
+        return None
 
 
 def _issue(scope: str, identity, problem: str) -> dict:

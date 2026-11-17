@@ -1,0 +1,50 @@
+[
+  {
+    "story_id": "night-ferry",
+    "revision": 1,
+    "title": "夜渡的船夫",
+    "tradition": "river_tales",
+    "source": {"reference": "田野卡片 2026-11-03", "kind": "oral_record"},
+    "characters": [
+      {"character_id": "ferryman", "name": "船夫", "sibling_order": 1},
+      {"character_id": "passenger", "name": "旅客", "sibling_order": 2}
+    ],
+    "events": [
+      {"event_id": "call", "sequence": 1, "actor_id": "passenger", "action": "请求渡河",
+       "consequence": "船夫拒绝夜行", "evidence": "录音转写 A1"},
+      {"event_id": "return", "sequence": 2, "actor_id": "ferryman", "action": "听见呼救后返航",
+       "consequence": "旅客获救", "evidence": "录音转写 A2"}
+    ]
+  },
+  {
+    "story_id": "broken-house",
+    "revision": 1,
+    "title": "空屋的三兄弟",
+    "tradition": "mountain",
+    "source": {"reference": "田野卡片 2026-11-05", "kind": "local_synthetic"},
+    "characters": [
+      {"character_id": "elder", "name": "长者", "sibling_order": 1}
+    ],
+    "events": [
+      {"event_id": "enter", "sequence": 1, "actor_id": "elder", "action": "进入空屋",
+       "consequence": "无人回应", "evidence": "样本片段 B1"}
+    ]
+  },
+  {
+    "story_id": "two-brothers",
+    "revision": 1,
+    "title": "两兄弟分家",
+    "tradition": "coast",
+    "source": {"reference": "田野卡片 2026-11-06", "kind": "oral_record"},
+    "characters": [
+      {"character_id": "elder", "name": "兄", "sibling_order": 1},
+      {"character_id": "younger", "name": "弟", "sibling_order": 2}
+    ],
+    "events": [
+      {"event_id": "split", "sequence": 1, "actor_id": "elder", "action": "独占渔船",
+       "consequence": "弟弟失去生计", "evidence": "录音转写 C1"},
+      {"event_id": "share", "sequence": 2, "actor_id": "younger", "action": "提出轮流使用",
+       "consequence": "兄弟和解", "evidence": "录音转写 C2"}
+    ]
+  }
+]

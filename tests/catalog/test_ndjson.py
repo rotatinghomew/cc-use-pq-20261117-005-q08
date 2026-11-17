@@ -3,7 +3,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from story_patterns.catalog.ndjson import read_story_file, read_story_lines
+from story_patterns.catalog.intake import rows_from_objects, unparseable_row
+from story_patterns.catalog.ndjson import (
+    read_source_file,
+    read_story_file,
+    read_story_lines,
+    rows_to_payload,
+    source_rows_from_text,
+)
 from story_patterns.errors import ValidationError
 from tests.support import story
 
@@ -59,6 +66,52 @@ class NdjsonReaderTests(unittest.TestCase):
             path.write_bytes(b"\xff\xfe")
             with self.assertRaisesRegex(ValidationError, "cannot read"):
                 read_story_file(path, "ndjson")
+
+
+class SourceRowReaderTests(unittest.TestCase):
+    def test_malformed_line_becomes_a_rejected_row_instead_of_aborting(self):
+        content = json.dumps(story("first")) + "\nnot-json\n" + json.dumps(story("second")) + "\n"
+        rows = source_rows_from_text(content, "ndjson")
+        self.assertEqual([row.row_number for row in rows], [1, 2, 3])
+        self.assertIsNotNone(rows[1].parse_error)
+        self.assertIn("line 2", rows[1].parse_error)
+        self.assertIsNone(rows[1].raw)
+
+    def test_row_numbers_count_non_blank_records_so_the_ledger_is_contiguous(self):
+        content = "\n" + json.dumps(story("a")) + "\n\n\n" + json.dumps(story("b")) + "\n"
+        rows = source_rows_from_text(content, "ndjson")
+        self.assertEqual([row.row_number for row in rows], [1, 2])
+
+    def test_non_object_json_line_is_a_row_error_with_its_line_number(self):
+        rows = source_rows_from_text("[]\n" + json.dumps(story("a")) + "\n", "ndjson")
+        self.assertIn("line 1", rows[0].parse_error)
+        self.assertEqual(rows[1].candidate_id(), "a")
+
+    def test_unparseable_marker_round_trips_through_the_envelope_layer(self):
+        rows = source_rows_from_text("not-json\n", "ndjson")
+        payload = rows_to_payload(rows)
+        self.assertEqual(payload, [unparseable_row("not-json", rows[0].parse_error)])
+        rewrapped = rows_from_objects(payload)[0]
+        self.assertEqual(rewrapped.parse_error, rows[0].parse_error)
+        self.assertEqual(rewrapped.raw_text, "not-json")
+        self.assertIsNone(rewrapped.candidate_id())
+
+    def test_json_array_rows_keep_their_index_as_row_number(self):
+        rows = source_rows_from_text(json.dumps([story("a"), story("b")]), "json")
+        self.assertEqual([row.row_number for row in rows], [1, 2])
+        self.assertEqual([row.candidate_id() for row in rows], ["a", "b"])
+
+    def test_empty_inputs_are_envelope_errors_not_empty_batches(self):
+        for text, format_name in [("", "ndjson"), ("\n \n", "ndjson"), ("[]", "json")]:
+            with self.subTest(text=text, format=format_name):
+                with self.assertRaisesRegex(ValidationError, "no story records"):
+                    source_rows_from_text(text, format_name)
+
+    def test_file_reader_wraps_io_errors(self):
+        with self.assertRaisesRegex(ValidationError, "format"):
+            read_source_file("unneeded.json", "yaml")
+        with self.assertRaisesRegex(ValidationError, "cannot read"):
+            read_source_file("does-not-exist.ndjson", "ndjson")
 
 
 if __name__ == "__main__":

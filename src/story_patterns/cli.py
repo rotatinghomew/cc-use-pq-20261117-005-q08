@@ -7,7 +7,7 @@ from pathlib import Path
 
 from story_patterns.application import StoryPatternApplication
 from story_patterns.analysis.export import export_csv, export_json
-from story_patterns.catalog.ndjson import read_story_file
+from story_patterns.catalog.ndjson import read_source_file, rows_to_payload
 from story_patterns.errors import NotFoundError, StoryPatternError
 
 
@@ -26,6 +26,9 @@ def parser() -> argparse.ArgumentParser:
     importer.add_argument("--file", required=True)
     importer.add_argument("--format", choices=("batch", "json", "ndjson"), default="batch")
     importer.add_argument("--batch-id")
+    importer.add_argument("--partial", action="store_true",
+                          help="store acceptable rows and quarantine rejected rows instead of aborting")
+    importer.add_argument("--retry-of", help="batch identifier this submission is a corrected retry of")
     reviewer = commands.add_parser("decide", help="record one evidence-backed review")
     reviewer.add_argument("--database", required=True)
     reviewer.add_argument("--file", required=True)
@@ -53,8 +56,12 @@ def parser() -> argparse.ArgumentParser:
     audit = commands.add_parser("audit", help="check local SQLite storage integrity")
     audit.add_argument("--database", required=True)
     preview = commands.add_parser("preview", help="validate all rows without writing to SQLite")
+    preview.add_argument("--database",
+                         help="optional database used only to classify rows against existing revisions")
     preview.add_argument("--file", required=True)
     preview.add_argument("--format", choices=("json", "ndjson"), required=True)
+    preview.add_argument("--batch-id")
+    preview.add_argument("--retry-of")
     compare = commands.add_parser("compare", help="compare tradition cohorts descriptively")
     compare.add_argument("--database", required=True)
     compare.add_argument("--minimum-reviewers", type=int, default=2)
@@ -62,6 +69,11 @@ def parser() -> argparse.ArgumentParser:
     lineage.add_argument("--database", required=True)
     manifest = commands.add_parser("manifest", help="summarize imported batches and source references")
     manifest.add_argument("--database", required=True)
+    batches = commands.add_parser("batches", help="list recorded import batches with their state")
+    batches.add_argument("--database", required=True)
+    batch_status = commands.add_parser("batch-status", help="show one batch's row ledger and digests")
+    batch_status.add_argument("--database", required=True)
+    batch_status.add_argument("--batch-id", required=True)
     search = commands.add_parser("search", help="find stories by narrative evidence and cohort labels")
     search.add_argument("--database", required=True)
     search.add_argument("--text")
@@ -75,15 +87,27 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def _import(arguments: argparse.Namespace, app: StoryPatternApplication) -> dict:
+    if arguments.format == "batch":
+        payload = read_json(arguments.file)
+        if arguments.retry_of:
+            if not isinstance(payload, dict):
+                raise StoryPatternError("batch input must be an object")
+            payload["retry_of"] = arguments.retry_of
+        return app.import_batch(payload, partial=arguments.partial)
+    if not arguments.batch_id:
+        raise StoryPatternError("--batch-id is required for JSON array and NDJSON imports")
+    payload = {"batch_id": arguments.batch_id,
+               "stories": rows_to_payload(read_source_file(arguments.file, arguments.format))}
+    if arguments.retry_of:
+        payload["retry_of"] = arguments.retry_of
+    return app.import_batch(payload, partial=arguments.partial)
+
+
 def execute(arguments: argparse.Namespace) -> dict:
-    app = StoryPatternApplication(arguments.database)
+    app = StoryPatternApplication(arguments.database) if getattr(arguments, "database", None) else None
     if arguments.command == "import":
-        if arguments.format == "batch":
-            return app.import_batch(read_json(arguments.file))
-        if not arguments.batch_id:
-            raise StoryPatternError("--batch-id is required for JSON array and NDJSON imports")
-        stories = read_story_file(arguments.file, arguments.format)
-        return app.import_batch({"batch_id": arguments.batch_id, "stories": stories})
+        return _import(arguments, app)
     if arguments.command == "decide":
         return app.record_decision(read_json(arguments.file))
     if arguments.command == "adjudicate":
@@ -109,8 +133,18 @@ def execute(arguments: argparse.Namespace) -> dict:
     if arguments.command == "audit":
         return app.audit()
     if arguments.command == "preview":
-        rows = read_story_file(arguments.file, arguments.format)
-        return app.preview_stories(rows)
+        rows = rows_to_payload(read_source_file(arguments.file, arguments.format))
+        if app is None:
+            from story_patterns.catalog.preview import preview_rows
+
+            if arguments.retry_of is not None:
+                raise StoryPatternError("--retry-of needs --database to compare against a recorded batch")
+            return preview_rows(rows, batch_id=arguments.batch_id)
+        return app.import_preview(arguments.batch_id, rows, arguments.retry_of)
+    if arguments.command == "batches":
+        return {"batches": app.recorded_batches()}
+    if arguments.command == "batch-status":
+        return app.batch_status(arguments.batch_id)
     if arguments.command == "compare":
         return app.compare_traditions(arguments.minimum_reviewers)
     if arguments.command == "lineage":
@@ -132,7 +166,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = execute(parser().parse_args(argv))
     except StoryPatternError as error:
-        print(json.dumps({"error": str(error)}, ensure_ascii=False), file=sys.stderr)
+        payload = {"error": str(error)}
+        payload.update(getattr(error, "details", {}) or {})
+        print(json.dumps(payload, ensure_ascii=False), file=sys.stderr)
         return 2
     print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
     return 0

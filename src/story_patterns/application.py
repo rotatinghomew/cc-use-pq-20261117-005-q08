@@ -13,8 +13,17 @@ class StoryPatternApplication:
         self.review = ReviewService(self.store)
         self.reports = ReportService(self.store)
 
-    def import_batch(self, batch: dict) -> dict:
-        return self.catalog.import_batch(batch)
+    def import_batch(self, batch: dict, partial: bool = False) -> dict:
+        return self.catalog.import_batch(batch, partial=partial)
+
+    def import_preview(self, batch_id: str | None, rows: list, retry_of: str | None = None) -> dict:
+        return self.catalog.preview(rows, batch_id=batch_id, retry_of=retry_of)
+
+    def batch_status(self, batch_id: str) -> dict:
+        return self.catalog.batch_status(batch_id)
+
+    def recorded_batches(self) -> list[dict]:
+        return self.catalog.batches()
 
     def record_decision(self, decision: dict) -> dict:
         return self.review.record_decision(decision)
@@ -28,8 +37,9 @@ class StoryPatternApplication:
     def stored_report(self, report_id: str) -> dict | None:
         return self.reports.get(report_id)
 
-    def preview_stories(self, rows: list[dict]) -> dict:
-        return self.catalog.preview(rows)
+    def preview_stories(self, rows: list[dict], batch_id: str | None = None,
+                        retry_of: str | None = None) -> dict:
+        return self.catalog.preview(rows, batch_id=batch_id, retry_of=retry_of)
 
     def revision_lineage(self) -> list[dict]:
         return self.catalog.lineage()

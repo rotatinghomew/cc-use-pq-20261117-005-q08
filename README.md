@@ -16,7 +16,51 @@ PYTHONPATH=src python -m story_patterns.cli demo --database /tmp/story-patterns.
 
 支持包含故事对象的 JSON 数组或逐行 NDJSON 导入；这两种格式需使用 `--batch-id`。`queue` 展示未评、待补共识、分歧及已达共识的样本，并列出尚未被判断引用的事件。`report` 同时给出标注员两两一致率及事件证据覆盖率；这些是描述性指标，不替代人工解释。报告以内容指纹保存，可用 `export --report-id ... --format json|csv --output ...` 输出；默认拒绝覆盖现有文件，显式 `--force` 才替换。`audit` 检查 SQLite 内部与外键完整性。
 
-导入前可以用 `preview` 汇总每条记录的校验错误，不写数据库；正式导入仍坚持整批事务。`lineage` 展示已录入的修订版本与缺失序号。`compare` 按传统标签分层输出描述性比例、共识数与覆盖率；不同分组的分母可能不同，结果不作因果或总体推断。
+导入前可以用 `preview` 汇总每条记录的校验错误，不写数据库。默认 `import` 仍是整批事务；加 `--partial` 时只写入可通过校验的记录，坏行、批内重复项、与既有修订冲突的行会留在批次台账中而不进入 `stories`，因此也不会进入任何报告分母。`lineage` 展示已录入的修订版本与缺失序号。`compare` 按传统标签分层输出描述性比例、共识数与覆盖率；不同分组的分母可能不同，结果不作因果或总体推断。
+
+### 批次状态、写入边界与重试
+
+每次 `import --partial` 都会在一个事务内写入两处内容：批次标记（`import_batches`）与逐行台账（`import_batch_rows`）。台账保存每一行的行号、规范化前的原始载荷、行指纹、判定状态与原因；只有状态为 `accepted` 或 `already_present` 的行才会写入 `stories` 与 `batch_stories`。批次状态由行状态推导：
+
+| 状态 | 含义 | 是否写入故事表 |
+| --- | --- | --- |
+| `accepted` | 所有行都可入库（含内容完全相同的既有修订） | 是 |
+| `partial` | 至少一行入库、至少一行被隔离 | 仅可接受行 |
+| `rejected` | 没有任何行可入库；批次仍记台账供复核 | 否 |
+
+行状态：`accepted`、`already_present`（同一修订版内容完全一致）、`invalid`（JSON 或字段校验失败）、`duplicate_in_batch`（同一批次重复出现同一 `story_id@revision`，两份都不入库）、`conflict`（该修订版已存在且内容不同，绝不覆盖）。
+
+两个摘要各司其职：
+
+- `source_digest` 覆盖按文件顺序排列的全部来源行（含被隔离的行与无法解析的原始文本），只由批次标识和行内容决定。它是重试时比较的对象。
+- `accepted_digest` 只覆盖本批实际入库的修订版，与旧版整批摘要同形，用于复核 `batch_stories` 与 `stories` 是否一致。
+
+重试规则：
+
+- 同一 `--batch-id` 提交完全相同的来源内容 → `already_imported`，不写任何新行、不改动台账或摘要，属于幂等重试。
+- 同一 `--batch-id` 提交不同内容 → 拒绝（退出码 2），错误 JSON 同时给出 `recorded_source_digest`、`submitted_source_digest` 与 `"idempotent": false`。这不会被误报为幂等成功。
+- 修复坏行后重投请使用**新**的批次标识并加 `--retry-of <原批次>`；两个批次各自独立、来源摘要不同，`retry_of` 保留修复链路。已入库的可接受行在新批次中显示为 `already_present`，不会重复计数。
+- 进程中断时事务回滚，批次标记与台账同时不存在，`batch-status` 返回 `"recorded": false`；同一内容可直接重投。只有提交成功才会留下批次记录。
+- 未加 `--partial` 的历史式导入同样写入台账，语义仍为全有或全无；旧数据库在首次打开时自动迁移，旧批次标记为 `legacy`，仍按已入库内容复核摘要。
+
+检查批次审计：
+
+```sh
+# 提交前：只读预检，含行状态与重试判定（相同/不同/新批次）
+PYTHONPATH=src python -m story_patterns.cli preview --database "$DB" \
+  --file fixtures/intake/import-2026-11-17.ndjson --format ndjson --batch-id intake-2026-11-17
+
+# 逐行台账：每行的状态、原因与修订版指纹
+PYTHONPATH=src python -m story_patterns.cli batch-status --database "$DB" --batch-id intake-2026-11-17
+
+# 全部批次的状态、两个摘要、修复链路与隔离行数
+PYTHONPATH=src python -m story_patterns.cli manifest --database "$DB"
+
+# 台账交叉复核：行指纹、来源摘要、批次状态推导、被隔离行不得入库、retry_of 必须存在
+PYTHONPATH=src python -m story_patterns.cli audit --database "$DB"
+```
+
+`preview` 的 `retry_assessment.kind` 会是 `new_batch`、`identical_retry`、`different_content` 或 `legacy_batch_unknown`；只有 `identical_retry` 的 `idempotent` 为 `true`。
 
 `manifest` 汇总导入批次、故事修订和来源引用。保存报告还包含读者剔除敏感性检查，提示结论是否依赖某位读者；该诊断不等同于置信区间。报告可导出为 Markdown (`--format md`) 供课程讨论。
 
@@ -37,3 +81,5 @@ PYTHONPATH=src python -m unittest discover -s tests -v
 PYTHONPATH=src python -m compileall -q src
 PYTHONPATH=src python -m story_patterns.cli demo --database /tmp/story-patterns-check.sqlite3 --fixture fixtures/demo.json
 ```
+
+样例输入在 `fixtures/intake/`：`import-2026-11-17.ndjson` 含一条格式错误行、一处未知角色、一组批内重复项与两条可接受记录；`retry-2026-11-18.json` 是修复后的 JSON 数组重投。

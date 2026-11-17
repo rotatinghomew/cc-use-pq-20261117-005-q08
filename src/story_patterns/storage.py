@@ -10,8 +10,27 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS import_batches (
     batch_id TEXT PRIMARY KEY,
     digest TEXT NOT NULL,
-    story_count INTEGER NOT NULL CHECK(story_count > 0)
+    story_count INTEGER NOT NULL CHECK(story_count >= 0),
+    source_digest TEXT,
+    source_row_count INTEGER,
+    state TEXT,
+    retry_of TEXT,
+    recorded_at TEXT
 );
+CREATE TABLE IF NOT EXISTS import_batch_rows (
+    batch_id TEXT NOT NULL REFERENCES import_batches(batch_id) ON DELETE RESTRICT,
+    row_number INTEGER NOT NULL CHECK(row_number > 0),
+    story_id TEXT,
+    revision INTEGER,
+    status TEXT NOT NULL,
+    reason TEXT,
+    row_digest TEXT NOT NULL,
+    story_digest TEXT,
+    payload TEXT NOT NULL,
+    parse_error TEXT,
+    PRIMARY KEY(batch_id, row_number)
+);
+CREATE INDEX IF NOT EXISTS import_batch_rows_by_status ON import_batch_rows(batch_id, status);
 CREATE TABLE IF NOT EXISTS stories (
     story_id TEXT NOT NULL,
     revision INTEGER NOT NULL CHECK(revision > 0),
@@ -88,8 +107,52 @@ class StoryStore:
         try:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(SCHEMA)
+            self._migrate(connection)
+            connection.commit()
         finally:
             connection.close()
+
+    @staticmethod
+    def _migrate(connection: sqlite3.Connection) -> None:
+        """Bring databases created before the batch ledger up to the new shape."""
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(import_batches)")}
+        if "source_digest" not in columns:
+            # The original CHECK(story_count > 0) cannot be relaxed in place and
+            # legacy rows carry no ledger.  Rebuild the table, keeping the
+            # existing batch markers so linked stories still have provenance.
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "CREATE TABLE import_batches_new ("
+                    " batch_id TEXT PRIMARY KEY, digest TEXT NOT NULL,"
+                    " story_count INTEGER NOT NULL CHECK(story_count >= 0),"
+                    " source_digest TEXT, source_row_count INTEGER, state TEXT,"
+                    " retry_of TEXT, recorded_at TEXT)"
+                )
+                connection.execute(
+                    "INSERT INTO import_batches_new(batch_id, digest, story_count, state) "
+                    "SELECT batch_id, digest, story_count, 'legacy' FROM import_batches"
+                )
+                connection.execute("DROP TABLE import_batches")
+                connection.execute("ALTER TABLE import_batches_new RENAME TO import_batches")
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+            finally:
+                connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS import_batch_rows ("
+            " batch_id TEXT NOT NULL REFERENCES import_batches(batch_id) ON DELETE RESTRICT,"
+            " row_number INTEGER NOT NULL CHECK(row_number > 0),"
+            " story_id TEXT, revision INTEGER, status TEXT NOT NULL, reason TEXT,"
+            " row_digest TEXT NOT NULL, story_digest TEXT, payload TEXT NOT NULL, parse_error TEXT,"
+            " PRIMARY KEY(batch_id, row_number))"
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS import_batch_rows_by_status ON import_batch_rows(batch_id, status)"
+        )
 
     @contextmanager
     def transaction(self):
@@ -214,7 +277,8 @@ class StoryStore:
     def catalog_manifest(self) -> tuple[list[dict], list[dict]]:
         with self.read_connection() as connection:
             batches = connection.execute(
-                "SELECT b.batch_id, b.digest, b.story_count, COUNT(bs.story_id) AS linked_story_count "
+                "SELECT b.batch_id, b.digest, b.story_count, b.source_digest, b.source_row_count, "
+                "b.state, b.retry_of, b.recorded_at, COUNT(bs.story_id) AS linked_story_count "
                 "FROM import_batches b LEFT JOIN batch_stories bs ON bs.batch_id=b.batch_id "
                 "GROUP BY b.batch_id ORDER BY b.batch_id"
             ).fetchall()
@@ -230,11 +294,39 @@ class StoryStore:
                 "batches": [dict(row) for row in connection.execute("SELECT * FROM import_batches ORDER BY batch_id")],
                 "batch_stories": [dict(row) for row in connection.execute(
                     "SELECT * FROM batch_stories ORDER BY batch_id, story_id, revision")],
+                "batch_rows": [dict(row) for row in connection.execute(
+                    "SELECT * FROM import_batch_rows ORDER BY batch_id, row_number")],
                 "decisions": [dict(row) for row in connection.execute("SELECT * FROM decisions ORDER BY decision_id")],
                 "adjudications": [dict(row) for row in connection.execute(
                     "SELECT * FROM adjudications ORDER BY adjudication_id")],
                 "reports": [dict(row) for row in connection.execute("SELECT * FROM reports ORDER BY report_id")],
             }
+
+    def batch_ledger(self, batch_id: str) -> dict | None:
+        with self.read_connection() as connection:
+            batch = connection.execute(
+                "SELECT * FROM import_batches WHERE batch_id=?", (batch_id,)
+            ).fetchone()
+            if batch is None:
+                return None
+            rows = connection.execute(
+                "SELECT * FROM import_batch_rows WHERE batch_id=? ORDER BY row_number", (batch_id,)
+            ).fetchall()
+        return {"batch": dict(batch), "rows": [dict(row) for row in rows]}
+
+    def recorded_batches(self) -> list[dict]:
+        with self.read_connection() as connection:
+            rows = connection.execute(
+                "SELECT batch_id, digest, source_digest, source_row_count, state, retry_of, story_count, recorded_at "
+                "FROM import_batches ORDER BY recorded_at, batch_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def batch_row_numbers(self, batch_id: str) -> set[int]:
+        with self.read_connection() as connection:
+            return {row["row_number"] for row in connection.execute(
+                "SELECT row_number FROM import_batch_rows WHERE batch_id=?", (batch_id,)
+            )}
 
     def report_document(self, report_id: str) -> dict | None:
         with self.read_connection() as connection:
